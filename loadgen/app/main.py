@@ -49,8 +49,8 @@ class LoadTestRequest(BaseModel):
     @field_validator("target_rps")
     @classmethod
     def valid_target_rps(cls, value: int):
-        if not 1 <= value <= 2000:
-            raise ValueError("Target rate must be between 1 and 2000 requests/second")
+        if not 1 <= value <= 8000:
+            raise ValueError("Target rate must be between 1 and 8000 requests/second")
         return value
 
 

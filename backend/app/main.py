@@ -1,3 +1,4 @@
+import asyncio
 import os
 import secrets
 import string
@@ -16,6 +17,24 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://shortener:shortener_local
 ALPHABET = string.ascii_letters + string.digits
 # code -> (link id, target url) for the redirect hot path. See follow_link.
 LINK_CACHE: dict[str, tuple[int, str]] = {}
+
+# Clicks are buffered in memory and written in batches by a background task, so a
+# redirect that hits LINK_CACHE touches the database zero times. Committing one
+# transaction per redirect was the largest remaining cost in the request path.
+#
+# The trade: a worker killed between flushes loses at most CLICK_FLUSH_SECONDS of
+# clicks. Analytics tolerate that; the link records themselves are still written
+# synchronously and are never buffered. Set CLICK_FLUSH_SECONDS=0 to write each
+# click in its own committed transaction, as earlier versions did.
+CLICK_FLUSH_SECONDS = float(os.getenv("CLICK_FLUSH_SECONDS", "0.2"))
+CLICK_FLUSH_MAX_ROWS = int(os.getenv("CLICK_FLUSH_MAX_ROWS", "500"))
+# Bounds memory if PostgreSQL is unreachable. Past this, the oldest clicks are
+# dropped and counted rather than growing the buffer without limit.
+CLICK_BUFFER_MAX_ROWS = int(os.getenv("CLICK_BUFFER_MAX_ROWS", "100000"))
+CLICK_INSERT = "INSERT INTO clicks (link_id, clicked_at, referrer, user_agent) VALUES (%s, %s, %s, %s)"
+click_buffer: list[tuple] = []
+click_flush_now = asyncio.Event()
+click_stats = {"buffered": 0, "written": 0, "batches": 0, "dropped": 0, "failures": 0}
 # Async pool with async handlers: the sync equivalent ran every request on a worker
 # thread, and that dispatch plus GIL contention cost more CPU than the query itself.
 pool = AsyncConnectionPool(
@@ -82,6 +101,59 @@ async def init_db():
         """)
 
 
+async def flush_clicks() -> int:
+    """Write the buffered clicks in one transaction. Returns the number written."""
+    global click_buffer
+    if not click_buffer:
+        return 0
+    batch, click_buffer = click_buffer, []
+    try:
+        async with database() as db:
+            cursor = db.cursor()
+            await cursor.executemany(CLICK_INSERT, batch)
+    except Exception:
+        # Put them back so the next flush retries, unless that would breach the cap.
+        click_stats["failures"] += 1
+        room = CLICK_BUFFER_MAX_ROWS - len(click_buffer)
+        if room > 0:
+            keep = batch[-room:]
+            click_stats["dropped"] += len(batch) - len(keep)
+            click_buffer = keep + click_buffer
+        else:
+            click_stats["dropped"] += len(batch)
+        return 0
+    click_stats["written"] += len(batch)
+    click_stats["batches"] += 1
+    return len(batch)
+
+
+async def click_writer():
+    """Flush on a timer, or as soon as a batch is full."""
+    while True:
+        try:
+            await asyncio.wait_for(click_flush_now.wait(), timeout=CLICK_FLUSH_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+        click_flush_now.clear()
+        await flush_clicks()
+
+
+def record_click(link_id: int, request: Request):
+    if len(click_buffer) >= CLICK_BUFFER_MAX_ROWS:
+        del click_buffer[0]
+        click_stats["dropped"] += 1
+    click_buffer.append((
+        link_id,
+        # The click's own time, not the flush time.
+        datetime.now(timezone.utc),
+        request.headers.get("referer"),
+        request.headers.get("user-agent"),
+    ))
+    click_stats["buffered"] += 1
+    if len(click_buffer) >= CLICK_FLUSH_MAX_ROWS:
+        click_flush_now.set()
+
+
 @app.on_event("startup")
 async def startup():
     await pool.open()
@@ -94,10 +166,21 @@ async def startup():
     except Exception:
         await pool.close()
         raise
+    if CLICK_FLUSH_SECONDS > 0:
+        app.state.click_writer = asyncio.create_task(click_writer())
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    writer = getattr(app.state, "click_writer", None)
+    if writer:
+        writer.cancel()
+        try:
+            await writer
+        except asyncio.CancelledError:
+            pass
+    # Drain whatever is still buffered before the pool goes away.
+    await flush_clicks()
     await pool.close()
 
 
@@ -122,7 +205,14 @@ def serialize_link(row: dict, request: Request) -> dict:
 async def health():
     async with database() as db:
         await db.execute("SELECT 1")
-    return {"status": "ok", "database": "postgresql", "worker_pid": os.getpid(), "pool": pool.get_stats()}
+    return {
+        "status": "ok",
+        "database": "postgresql",
+        "worker_pid": os.getpid(),
+        "pool": pool.get_stats(),
+        "clicks": {**click_stats, "pending": len(click_buffer), "flush_seconds": CLICK_FLUSH_SECONDS},
+        "cached_links": len(LINK_CACHE),
+    }
 
 
 @app.post("/api/links", status_code=201)
@@ -192,16 +282,15 @@ async def follow_link(code: str, request: Request):
     # ponytail: plain dict, per worker. Reach for a shared cache only if link count stops
     # fitting comfortably in each worker's memory.
     cached = LINK_CACHE.get(code)
-    async with database() as db:
-        if cached is None:
+    if cached is None:
+        async with database() as db:
             link = await (await db.execute("SELECT id, target_url FROM links WHERE code = %s", (code,))).fetchone()
             if not link:
                 raise HTTPException(404, "Short link not found")
             cached = LINK_CACHE[code] = (link["id"], link["target_url"])
-        # Commit one click row before returning every successful redirect. The database
-        # supplies the timestamp, which saves formatting and parsing one string per click.
-        await db.execute(
-            "INSERT INTO clicks (link_id, clicked_at, referrer, user_agent) VALUES (%s, now(), %s, %s)",
-            (cached[0], request.headers.get("referer"), request.headers.get("user-agent")),
-        )
+    # Buffered, then written in batches by click_writer. On a cache hit this whole
+    # handler touches the database zero times, which is what the redirect path costs now.
+    record_click(cached[0], request)
+    if CLICK_FLUSH_SECONDS <= 0:
+        await flush_clicks()
     return RedirectResponse(cached[1], status_code=307)

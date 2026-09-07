@@ -40,8 +40,15 @@ async def main():
         assert redirect.status == 307
         assert redirect.getheader("location") == "https://example.com/postgres-check"
         redirect.read()
-    async with database() as db:
-        count = (await (await db.execute("SELECT COUNT(*) AS n FROM clicks JOIN links ON links.id = clicks.link_id WHERE code = %s", (code,))).fetchone())["n"]
+    # Clicks are buffered and flushed in batches, so wait for the writer rather than
+    # reading immediately. Fails if they never arrive.
+    count = 0
+    for _ in range(40):
+        async with database() as db:
+            count = (await (await db.execute("SELECT COUNT(*) AS n FROM clicks JOIN links ON links.id = clicks.link_id WHERE code = %s", (code,))).fetchone())["n"]
+        if count == 5:
+            break
+        await asyncio.sleep(0.25)
     assert count == 5, count
     for path in ("/api/stats", "/api/links"):
         client.request("GET", path)
@@ -49,7 +56,7 @@ async def main():
         assert response.status == 200
         response.read()
     client.close()
-    print("Verified: 5 redirects persisted; migration rerun is idempotent.")
+    print("Verified: 5 redirects persisted through the batch writer; migration rerun is idempotent.")
 
 
 if __name__ == "__main__":
