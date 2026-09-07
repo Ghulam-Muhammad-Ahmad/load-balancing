@@ -111,6 +111,110 @@ so measuring on the same machine meaningfully lowers the ceiling; a client on se
 For context, the first measurement of this system was **103 rps** with a p50 of 9.7 s and an 89% error rate. Most of
 that gap was the measuring instrument, not the application.
 
+## Running this on AWS: cost at 300-500 rps
+
+An estimate, not a bill -- but built on measured numbers from this architecture rather than
+rules of thumb. Prices are us-east-1 on-demand, ARM (Graviton), and were current at the time
+of writing; check the [AWS Pricing Calculator](https://calculator.aws) before budgeting.
+
+### The traffic math
+
+| | 300 rps | 500 rps |
+| --- | --- | --- |
+| Requests/month | 778 million | **1.30 billion** |
+| Click rows/month | 778 million | **1.30 billion** |
+| Storage growth/month | 146 GiB | **243 GiB** |
+| Accumulated after 12 months | 1.7 TiB | **2.8 TiB** |
+| Egress/month, incl. TLS overhead | ~160 GiB | ~265 GiB |
+
+Measured inputs: **200.9 bytes per click row** (heap plus index) and **169-byte** 307 responses.
+Those rows have `referrer` NULL, as load-test traffic does; real browser traffic populates it, so
+budget nearer **260 bytes/row** and add about 30% to the storage figures.
+
+### Compute is nearly free
+
+Measured CPU, all three services, at the rates in question:
+
+| | 300 rps | 500 rps |
+| --- | --- | --- |
+| Backend, 8 workers | 0.55 cores | 0.66 cores |
+| PostgreSQL | 0.44 cores | 0.57 cores |
+| Nginx | 0.17 cores | 0.17 cores |
+| **Total** | **1.16 cores** | **1.40 cores** |
+
+Resident memory: backend 343 MB, PostgreSQL 158 MB, Nginx 11 MB. 500 rps fits comfortably on two
+small instances. This is what the optimisation work bought -- before it, 500 rps was near the ceiling
+of a 12-core machine.
+
+### Monthly cost at 500 rps
+
+Lean: 2x `t4g.small`, `db.t4g.medium` single-AZ.
+
+| | Month 1 | Month 12 |
+| --- | --- | --- |
+| EC2, 2x t4g.small | $25 | $25 |
+| ALB, base + ~2 LCU | $28 | $28 |
+| RDS db.t4g.medium | $47 | $47 |
+| **RDS storage** | **$28** | **$335** |
+| Egress, 165 GiB billable | $15 | $15 |
+| Cross-AZ transfer, CloudWatch | $18 | $18 |
+| **Total** | **~$161** | **~$468** |
+
+Production: 2x `c7g.large`, `db.m7g.large` Multi-AZ.
+
+| | Month 1 | Month 12 |
+| --- | --- | --- |
+| EC2, 2x c7g.large | $106 | $106 |
+| ALB | $28 | $28 |
+| RDS Multi-AZ | $249 | $249 |
+| **RDS storage, charged twice** | **$56** | **$670** |
+| Egress and misc | $40 | $40 |
+| **Total** | **~$479** | **~$1,093** |
+
+At 300 rps, take roughly 40% off the storage lines: lean about $150 rising to $310, production about
+$460 rising to $720.
+
+### Storage of raw clicks is the entire cost curve
+
+Compute is flat and cheap. Storage grows forever, and by month 12 it is 60-70% of the bill. Reserved
+Instances or a Savings Plan cut compute by about 40%, which barely moves the total.
+
+Two levers, both measured:
+
+1. **`user_agent` is 112 of the 201 bytes.** Storing only `id`, `link_id` and `clicked_at` takes a row
+   from 201 to **59.4 bytes** -- 3.4x less storage.
+2. **Seven-day raw retention plus hourly rollups.** At 500 rps, seven days of raw clicks is a *steady*
+   61 GiB instead of unbounded growth. Partition `clicks` by day, roll up to per-link-per-hour counts,
+   and archive raw partitions to S3 Glacier Instant Retrieval at $0.004/GiB.
+
+With retention the bill stops growing:
+
+| | Month 1 | Month 12 |
+| --- | --- | --- |
+| Production + 7-day retention | ~$420 | **~$430** |
+| ...and RDS downsized, since the table is now small | ~$270 | **~$280** |
+
+About **$280/month flat against $1,093 and climbing**, for identical traffic.
+
+### Three things to fix before this touches AWS
+
+1. **`POST /api/load-test` is publicly routed.** `nginx.conf` proxies it straight to the load generator.
+   Exposed to the internet, anyone can make your own infrastructure attack itself at up to 8000 rps.
+   Do not deploy the `loadgen` container to production, or put it behind authentication on a private
+   network. It exists to measure a local stack.
+2. **`/api/links` will not survive.** The page polls it every second and it aggregates the whole
+   `clicks` table. Fine at 320k rows (4.5 ms); at 1.3 billion it is an index-only scan of a billion
+   entries every second, forever. Rollup tables fix this and the storage cost together.
+3. **Buffered clicks versus instance termination.** At 500 rps, 0.2 s of buffer is about 100 clicks per
+   worker. Graceful shutdown drains it, but a spot interruption or hard scale-in does not. Set the ALB
+   deregistration delay above the flush interval, and do not run this on spot instances unless that
+   loss is acceptable.
+
+Not priced here: Fargate (broadly comparable, simpler operationally), Aurora Serverless v2 (cheaper at
+low load, dearer at a sustained 500 rps), CloudFront in front of the ALB (would reduce egress cost and
+offload TLS), Route 53, and NAT Gateway -- avoid the last one, as $32/month plus $0.045/GiB will quietly
+exceed the compute bill.
+
 Backend:
 
 ```bash
