@@ -1,0 +1,67 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    # Eight workers times a 12-connection pool is 96 backend connections, plus room
+    # for psql and the startup migration. Default shared_buffers is 128MB.
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=512MB"]
+    environment:
+      POSTGRES_DB: shortener
+      POSTGRES_USER: shortener
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shortener_local}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shortener -d shortener"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://shortener:${POSTGRES_PASSWORD:-shortener_local}@postgres:5432/shortener
+      LEGACY_SQLITE_PATH: /legacy/links.db
+      DB_POOL_MIN_SIZE: "2"
+      DB_POOL_MAX_SIZE: "20"
+      DB_POOL_TIMEOUT: "3"
+    volumes:
+      - shortener_data:/legacy:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  loadgen:
+    build: ./loadgen
+    restart: unless-stopped
+    environment:
+      TARGET_BASE_URL: http://frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+      loadgen:
+        condition: service_healthy
+
+volumes:
+  shortener_data:
+  postgres_data:
